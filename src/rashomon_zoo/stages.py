@@ -42,35 +42,62 @@ def seed_everything(seed: int) -> None:
         pass
 
 
-def tune(zoo_dir: Path, task: str, model_class: str, grid: dict, *, score_split: str, seeds: Iterable[int] = (0,),
-         name: str = "tuning") -> dict:
-    """Grid search scored by accuracy on the held-out set `score_split` (mean over `seeds`; no default: that set
-    then informs a choice, recorded). Writes <task>/<model_class>/_tune/<name>/. Returns the best configuration."""
-    if score_split not in HELD_OUT:
+def tune(zoo_dir: Path, task: str, model_class: str, grid: dict, *, score_split: str | None = None,
+         cv: int | None = None, cv_seed: int = 0, seeds: Iterable[int] = (0,), name: str = "tuning") -> dict:
+    """Grid search scored by accuracy, either on the held-out set `score_split` (that set then informs a choice,
+    recorded) or by stratified `cv`-fold cross-validation inside the training split (folds drawn with `cv_seed`;
+    the held-out sets are not used). Give exactly one of the two. Score: mean over seeds (and folds); the
+    configuration with the highest mean wins. Writes <task>/<model_class>/_tune/<name>/ (tuning.csv: one row per
+    configuration; folds.csv with cv: one row per configuration, fold and seed). Returns the best configuration."""
+    if (score_split is None) == (cv is None):
+        raise ValueError("give exactly one of score_split / cv")
+    if score_split is not None and score_split not in HELD_OUT:
         raise ValueError(f"score_split must be one of {HELD_OUT}")
+    if cv is not None and (not isinstance(cv, int) or cv < 2):
+        raise ValueError(f"cv must be an integer >= 2, got {cv!r}")
+    seeds = [int(s) for s in seeds]
     t = load_task(zoo_dir, task)
     mc = modelzoo.get(model_class)
     Xtr, ytr = t.X["train"], t.y["train"]
+    if cv is not None:
+        from sklearn.model_selection import StratifiedKFold
+        folds = list(StratifiedKFold(cv, shuffle=True, random_state=cv_seed).split(Xtr, ytr))
+    else:
+        folds = [(np.arange(len(Xtr)), None)]
     keys = sorted(grid)
-    rows = []
+    rows, fold_rows = [], []
     for values in itertools.product(*(grid[k] for k in keys)):
         params = dict(zip(keys, values))
-        mc.resolve(params, t.n_features, t.n_classes)  # unknown / inapplicable keys raise before training
+        effective = mc.resolve(params, t.n_features, t.n_classes)  # unknown / inapplicable keys raise before training
+        if cv is not None and effective.get("stopping_split"):
+            raise ValueError("cv: early stopping on a held-out set would use it for tuning; use fixed steps")
         accs = []
-        for s in seeds:
-            seed_everything(int(s))
-            m = mc.build(params, t.n_features, t.n_classes)
-            m, _ = mc.fit(m, Xtr, ytr, *_stopping_data(t, mc.resolve(params, t.n_features, t.n_classes)), s, params)
-            accs.append(float((mc.proba(m, t.X[score_split]).argmax(1) == t.y[score_split]).mean()))
+        for f, (fit_idx, val_idx) in enumerate(folds):
+            Xs, ys = Xtr[fit_idx], ytr[fit_idx]
+            Xv, yv = (t.X[score_split], t.y[score_split]) if val_idx is None else (Xtr[val_idx], ytr[val_idx])
+            for s in seeds:
+                seed_everything(s)
+                m = mc.build(params, t.n_features, t.n_classes)
+                m, _ = mc.fit(m, Xs, ys, *_stopping_data(t, effective), s, params)
+                acc = float((mc.proba(m, Xv).argmax(1) == yv).mean())
+                accs.append(acc)
+                fold_rows.append({**{f"param_{k}": str(v) for k, v in params.items()}, "fold": f, "seed": s,
+                                  "n_fit": len(ys), "n_score": len(yv), "score": acc})
         rows.append({**{f"param_{k}": str(v) for k, v in params.items()}, "score_mean": np.mean(accs),
-                     "score_std": np.std(accs), "params": params})
-    tuning = pd.DataFrame(rows).sort_values("score_mean", ascending=False)  # one row per configuration
+                     "score_std": np.std(accs), "n_scores": len(accs), "params": params})
+    tuning = pd.DataFrame(rows).sort_values("score_mean", ascending=False, kind="stable")  # one row per configuration
     best = tuning.iloc[0]["params"]
     tune_dir = Path(zoo_dir) / task / model_class / "_tune" / name
     tune_dir.mkdir(parents=True, exist_ok=True)
     tuning.drop(columns="params").to_csv(tune_dir / "tuning.csv", index=False)
-    write_json(tune_dir / "manifest.json", {"task": task, "model_class": model_class, "grid": grid, "seeds": list(seeds),
-                                     "score": f"accuracy on {score_split} (mean over seeds)", "score_split": score_split, "best": best,
+    if cv is not None:
+        pd.DataFrame(fold_rows).to_csv(tune_dir / "folds.csv", index=False)
+    score = (f"accuracy on {score_split} (mean over seeds)" if cv is None else
+             f"accuracy, stratified {cv}-fold cross-validation on the training split (mean over folds and seeds)")
+    write_json(tune_dir / "manifest.json", {"task": task, "model_class": model_class, "grid": grid, "seeds": seeds,
+                                     "score": score, "score_split": score_split, "cv": cv,
+                                     "cv_seed": cv_seed if cv is not None else None, "best": best,
+                                     "selection": "highest mean score (first in grid order on ties)",
                                      "task_hash": task_hash(t), "environment": environment()})
     return best
 

@@ -330,7 +330,7 @@ def test_held_out_roles_explicit(zoo_dir):
     r = stages.train(zoo_dir, "toy", "nn", "es", seeds=[0], params={"hidden": [4], "stopping": "early_stopping",
                                                                  "stopping_split": "holdout_2", "max_epochs": 3})
     assert r.manifest()["params"]["stopping_split"] == "holdout_2"
-    with pytest.raises(TypeError):
+    with pytest.raises(ValueError, match="score_split / cv"):  # no default: the scoring data are named
         stages.tune(zoo_dir, "toy", "xgb", {"n_estimators": [5]})
     best = stages.tune(zoo_dir, "toy", "xgb", {"n_estimators": [5, 10]}, score_split="holdout_2")
     assert best["n_estimators"] in (5, 10)
@@ -350,3 +350,149 @@ def test_class_names_recorded(tmp_path):
     assert t.info["class_names"] == ["malignant", "benign"]  # label id -> name (scikit-learn's target_names)
     t2 = make_task(tmp_path, "breastcancer", splits=(0.6, 0.2, 0.2), task_name="bc_spec")
     assert t2.info["class_names"] == ["malignant", "benign"]
+
+
+def test_tune_cv(zoo_dir):
+    """cv: folds inside the training split, held-out sets unused; exactly one of score_split / cv"""
+    import pandas as pd
+    from rashomon_zoo.store import read_json
+    grid = {"n_estimators": [5, 10], "max_depth": [2]}
+    best = stages.tune(zoo_dir, "toy", "xgb", grid, cv=3, name="cv")
+    d = zoo_dir / "toy" / "xgb" / "_tune" / "cv"
+    folds = pd.read_csv(d / "folds.csv")
+    assert len(folds) == 2 * 3 and set(folds["n_fit"] + folds["n_score"]) == {400}
+    man = read_json(d / "manifest.json")
+    assert man["cv"] == 3 and man["score_split"] is None and man["best"] == best
+    with pytest.raises(ValueError):
+        stages.tune(zoo_dir, "toy", "xgb", grid)
+    with pytest.raises(ValueError):
+        stages.tune(zoo_dir, "toy", "xgb", grid, cv=3, score_split="holdout_1")
+
+
+def test_sample_order_nested_stratified():
+    from rashomon_zoo.explain import sample_order
+    y = np.array([0] * 70 + [1] * 30)
+    o = sample_order(y, seed=1)
+    assert sorted(o) == list(range(100))
+    for n in (10, 20, 50):
+        assert abs((y[o[:n]] == 1).sum() - 0.3 * n) <= 1
+    assert not np.array_equal(o, sample_order(y, seed=2))
+
+
+def test_explain_samples_and_derive(zoo_dir):
+    from rashomon_zoo.explain import derive, sample_order
+    from rashomon_zoo.store import load_task
+    r = stages.train(zoo_dir, "toy", "xgb", "t", seeds=range(2), params={"n_estimators": 10, "subsample": 0.9})
+    explain(r, "lime_tabular", split="holdout_1", params={"n_samples": 300}, samples=30, out_name="l30")
+    explain(r, "shap_tree", split="holdout_1", samples=15, out_name="t15")
+    i30 = r.explainer_manifest("l30")["sample_indices"]
+    i15 = r.explainer_manifest("t15")["sample_indices"]
+    t = load_task(zoo_dir, "toy")
+    assert i30 == sorted(sample_order(t.y["holdout_1"], 0)[:30].tolist()) and set(i15) <= set(i30)
+    assert r.explanations("l30", "holdout_1").shape == (2, 30, 6)
+    derive(r, "l30", "l30_x")
+    X = t.X["holdout_1"][i30]
+    assert np.allclose(r.explanations("l30_x", "holdout_1"), r.explanations("l30", "holdout_1") * X[None])
+    assert r.explainer_manifest("l30_x")["derived_from"] == "l30"
+    with pytest.raises(ValueError):
+        explain(r, "shap_tree", split="holdout_1", samples=101, out_name="too_many")
+
+
+def test_shap_tree_train_mean_equals_exact_ks(zoo_dir):
+    """random forest (probability = mean of leaf values, no output transform): interventional TreeSHAP with the
+    training mean as the only background point = exact KernelSHAP with that baseline (d = 6: shap enumerates all
+    coalitions). Not so for xgboost with model_output="probability" (shap 0.54.1; see explain.DEFAULTS)."""
+    r = stages.train(zoo_dir, "toy", "rf", "t", seeds=[0], params={"n_estimators": 20})
+    explain(r, "shap_tree", split="holdout_1", params={"baseline": "train_mean"}, samples=20, out_name="tree_mean")
+    explain(r, "ks_shap", split="holdout_1", params={"n_samples": 1000}, samples=20, out_name="ks_exact")
+    a, b = r.explanations("tree_mean", "holdout_1"), r.explanations("ks_exact", "holdout_1")
+    assert np.allclose(a, b, atol=1e-4)
+
+
+def test_heloc_fico_loader(tmp_path, monkeypatch):
+    """drops rows that are -9 everywhere, keeps the other special values, class 0 = Bad"""
+    import pandas as pd
+    from rashomon_zoo import tasks
+    cols = ["RiskPerformance"] + [f"f{i}" for i in range(23)]
+    rows = [["Bad"] + [-9] * 23, ["Bad"] + [-9] * 23]
+    rng = np.random.default_rng(0)
+    for i in range(40):
+        r = list(rng.integers(0, 100, 23)); r[3] = -7 if i % 3 == 0 else r[3]; r[5] = -8 if i % 4 == 0 else r[5]
+        rows.append(["Good" if i % 2 else "Bad"] + r)
+    (tmp_path / "HELOC_FICO").mkdir()
+    pd.DataFrame(rows, columns=cols).to_csv(tmp_path / "HELOC_FICO" / "heloc_dataset_v1.csv", index=False)
+    monkeypatch.setenv("RASHOMON_ZOO_DATASETS", str(tmp_path))
+    r = tasks.raw_data("heloc_fico")
+    assert r["X"].shape == (40, 23) and r["class_names"] == ["Bad", "Good"]
+    assert (r["X"][:, 3] == -7).sum() == 14 and (r["X"][:, 5] == -8).sum() == 10
+    assert list(r["y"][:2]) == [0, 1] and "X_test_fixed" not in r
+
+
+def test_shap_tree_multiclass_xgb_clear_error(tmp_path):
+    X, y = make_classification(n_samples=300, n_features=5, n_informative=4, n_redundant=0, n_classes=3, random_state=0)
+    X = StandardScaler().fit_transform(X).astype(np.float32)
+    idx = {"train": slice(0, 200), "holdout_2": slice(200, 250), "holdout_1": slice(250, 300)}
+    save_task(tmp_path, Task("toy3", {k: X[v] for k, v in idx.items()}, {k: y[v] for k, v in idx.items()}, 3, {}))
+    r = stages.train(tmp_path, "toy3", "xgb", "t", seeds=[0], params={"n_estimators": 5})
+    with pytest.raises(ValueError, match="multi-class"):
+        explain(r, "shap_tree", split="holdout_1")
+    explain(r, "shap_tree", split="holdout_1", params={"model_output": "raw"}, out_name="raw")
+    assert r.explanations("raw", "holdout_1").shape == (1, 50, 5)
+
+
+def test_lime_sample_scale(zoo_dir):
+    """sample_scale narrows lime's perturbations; recorded in the manifest; 1.0 = package behaviour"""
+    r = stages.train(zoo_dir, "toy", "nn", "t", seeds=[0], params={"hidden": [16], "n_steps": 200})
+    explain(r, "lime_tabular", split="holdout_1", params={"n_samples": 500}, samples=10, out_name="w1")
+    explain(r, "lime_tabular", split="holdout_1", params={"n_samples": 500, "sample_scale": 1.0}, samples=10,
+            out_name="w1b")
+    explain(r, "lime_tabular", split="holdout_1", params={"n_samples": 500, "sample_scale": 0.1}, samples=10,
+            out_name="w01")
+    assert np.allclose(r.explanations("w1", "holdout_1"), r.explanations("w1b", "holdout_1"))
+    assert not np.allclose(r.explanations("w1", "holdout_1"), r.explanations("w01", "holdout_1"))
+    assert r.explainer_manifest("w01")["params"]["sample_scale"] == 0.1
+    # units: slopes per training standard deviation for every scale (a smooth model: similar magnitudes)
+    a1, a01 = r.explanations("w1", "holdout_1"), r.explanations("w01", "holdout_1")
+    ratio = np.abs(a01).mean() / np.abs(a1).mean()
+    assert 0.2 < ratio < 5
+
+
+def test_smoothgrad_targets_follow_samples(zoo_dir):
+    """with (almost) no noise SmoothGrad equals vanilla gradients for every sample, also in batches with several
+    predicted classes (the legacy code assigned other samples' targets to the noisy copies)"""
+    import torch
+    from rashomon_zoo import attribution as A
+    r = stages.train(zoo_dir, "toy", "nn", "t", seeds=[0], params={"hidden": [16], "n_steps": 200})
+    m = r.load_model(0)
+    from rashomon_zoo.store import load_task
+    X = torch.from_numpy(load_task(zoo_dir, "toy").X["holdout_1"][:30])
+    infer = lambda x: torch.softmax(m(x), 1)  # noqa: E731
+    with torch.no_grad():
+        y = infer(X).argmax(1)
+    assert len(torch.unique(y)) == 2
+    vg = A.vanilla_grad(m, X, targets=y, inference_fn=infer)
+    sg = A.smooth_grad(m, X, targets=y, inference_fn=infer, n_samples=7, noise_level=1e-7, random_state=0)
+    vg, sg = (v[0] if isinstance(v, tuple) else v for v in (vg, sg))
+    assert np.allclose(sg.detach().numpy(), vg.detach().numpy(), atol=1e-5)
+
+
+def test_smoothgrad_noise_per_sample(zoo_dir):
+    """identical samples in one batch get independent noise (different SmoothGrad values); same seed, same values"""
+    import torch
+    from rashomon_zoo import attribution as A
+    r = stages.train(zoo_dir, "toy", "nn", "t", seeds=[0], params={"hidden": [16], "n_steps": 200})
+    m = r.load_model(0)
+    from rashomon_zoo.store import load_task
+    x = torch.from_numpy(load_task(zoo_dir, "toy").X["holdout_1"][:1])
+    X = x.repeat(2, 1)
+    infer = lambda z: torch.softmax(m(z), 1)  # noqa: E731
+    y = infer(X).argmax(1).detach()
+
+    def sg(seed):
+        out = A.smooth_grad(m, X, targets=y, inference_fn=infer, n_samples=20, noise_level=0.5, random_state=seed,
+                            force_random=False)
+        return (out[0] if isinstance(out, tuple) else out).detach().numpy()
+
+    a = sg(0)
+    assert not np.allclose(a[0], a[1])
+    assert np.allclose(a, sg(0))

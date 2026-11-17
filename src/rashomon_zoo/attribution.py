@@ -107,11 +107,14 @@ def smooth_grad(model: torch.nn.Module, data: torch.Tensor, targets: torch.Tenso
         targets = _get_targets(inference_fn, data, model, device)
 
     noise = noise_level * std
+    # independent noise for every sample and copy (as in SmoothGrad); the legacy code drew one set of n_samples
+    # vectors and reused it for all samples, which correlated the errors across samples (changed 2026-11-17)
+    n_draws = data.shape[0] * n_samples if n_samples > 1 else n_samples
     if force_random:
-        perturbation = torch.normal(mean=0., std=noise, size=(n_samples, *data.shape[1:]))
+        perturbation = torch.normal(mean=0., std=noise, size=(n_draws, *data.shape[1:]))
     else:
         with TorchRandomSeed(random_state):
-            perturbation = torch.normal(mean=0., std=noise, size=(n_samples, *data.shape[1:]))
+            perturbation = torch.normal(mean=0., std=noise, size=(n_draws, *data.shape[1:]))
 
     if n_samples <= 1:
         perturbed_data = data
@@ -120,8 +123,10 @@ def smooth_grad(model: torch.nn.Module, data: torch.Tensor, targets: torch.Tenso
     else:
         # each element in dim 0 is repeated n_samples times, contiguously
         perturbed_data = torch.repeat_interleave(data, repeats=n_samples, dim=0)
-        targets_expanded = targets.unsqueeze(0).expand(n_samples, targets.shape[0]).reshape(-1)
-        perturbation = perturbation.unsqueeze(0).expand(data.shape[0], *perturbation.shape).reshape(-1, *perturbation.shape[1:])
+        # same order as perturbed_data (sample-major). The legacy code (lxg, RashomonEffect) used
+        # targets.unsqueeze(0).expand(n_samples, n).reshape(-1), i.e. noise-major: rows got the targets of other
+        # samples whenever a batch held more than one class (fixed 2026-11-17)
+        targets_expanded = torch.repeat_interleave(targets, repeats=n_samples, dim=0)
         batch_size = n_samples
 
     perturbed_data = perturbed_data + perturbation

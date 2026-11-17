@@ -304,8 +304,32 @@ def _return_dataverse(X_tr_orig, Y_tr_orig, X_te, Y_te, batch_sizes, as_torch=Tr
         return (X_tr, Y_tr), (X_te, Y_te), (X_val, Y_val), n_dims, n_classes
 
 
+def get_heloc_fico(random_state=42, batch_sizes=(32, 1050), train_size=0.8, as_torch=True, root=None):
+    """HELOC as published by FICO (Explainable Machine Learning Challenge): HELOC_FICO/heloc_dataset_v1.csv under
+    DATA_ROOT (download from FICO after accepting their terms; not redistributable here).
+    10459 rows, 23 integer features, RiskPerformance Bad / Good -> class 0 = Bad, 1 = Good (sorted by name).
+    The 588 rows that are -9 ("no bureau record") in every feature are dropped (they are identical; the Dataverse
+    version drops them too). All other special values are kept as they are: -7 (condition not met, e.g. never
+    delinquent), -8 (no usable / valid trades or inquiries), -9 (no record; 10 values of ExternalRiskEstimate).
+    No provider test file: splits come from the task specification."""
+    global last_class_names
+    import pandas as pd
+    pth = (root if root is not None else os.environ.get('RASHOMON_ZOO_DATASETS', DATA_ROOT)) + '/HELOC_FICO/heloc_dataset_v1.csv'
+    d = pd.read_csv(pth)
+    X = d.drop(columns='RiskPerformance')
+    keep = ~(X == -9).all(axis=1)
+    X, labels = X[keep].to_numpy(dtype=float), d.loc[keep, 'RiskPerformance'].to_numpy()
+    classes = sorted(np.unique(labels))
+    last_class_names = [str(c) for c in classes]
+    y = np.array([classes.index(c) for c in labels])
+    return _return_dataset(X, y, batch_sizes, train_size, as_torch=as_torch, random_state=random_state)
+
+
 def get_heloc(random_state=None, batch_sizes=(32, 1050), as_torch=True, root=DATA_ROOT, stratified_sampling=True):
-    # "Home Equity Line Of Credit"
+    # "Home Equity Line Of Credit", Dataverse version.
+    # WARNING (2026-11-17): this version leaks the label. FICO's special values were replaced by one constant per class
+    # (e.g. NetFractionInstallBurden 66.516... only for class 1, 70.210... only for class 0), in train and test.
+    # Tree models reach ~0.83 accuracy (~0.73 on the original). Kept to reproduce paper C; use heloc_fico otherwise.
     # numerical, 24d
     # train https://dataverse.harvard.edu/file.xhtml?fileId=8550942&datasetVersionId=374726
     # test https://dataverse.harvard.edu/file.xhtml?fileId=8550943&datasetVersionId=374726
@@ -543,6 +567,7 @@ __info_dim_classes = {
     'ionosphere': (34, 2),
 
     'heloc': (23, 2),
+    'heloc_fico': (23, 2),
     'heart': (9, 2),
     'pima': (5, 2),
     'gmsc': (5, 2),
@@ -581,7 +606,8 @@ dataset_callables = {
     'autouniv': get_autouniv,  # openml, synthetic
     # tabular, binary
     'breastcancer': get_breast_cancer,
-    'heloc': get_heloc,
+    'heloc': get_heloc,  # Dataverse version: leaks the label (see get_heloc)
+    'heloc_fico': get_heloc_fico,
     'pima': get_pima,
     'heart': get_heart,
     'gmsc': get_gmsc,

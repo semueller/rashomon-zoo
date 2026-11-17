@@ -46,8 +46,13 @@ DEFAULTS = {
     # (5000 samples, kernel width 0.75 * sqrt(d), Ridge)
     "lime_tabular": {"n_samples": 5000, "discretize_continuous": False, "sample_around_instance": True,
                      "kernel_width": None, "seed": 0},
+    # background: `background_size` training samples drawn with `seed` (default), or baseline="train_mean": the
+    # training mean as the only background point. For random forests this is the exact Shapley value KernelSHAP
+    # (ks_shap, same baseline) estimates. For xgboost with model_output="probability" it is not (shap 0.54.1: checked
+    # against brute-force Shapley values of the probability, which ks_shap matches); there the logistic transform
+    # is handled approximately, efficiency still holds.
     "shap_tree": {"model_output": "probability", "feature_perturbation": "interventional", "background_size": 100,
-                  "seed": 0},  # seed: draw of the background samples
+                  "baseline": None, "seed": 0},
     "builtin": {},
     "permutation": {"n_repeats": 10, "split": None, "seed": 0},  # split: held-out set to permute on (required)
 }
@@ -145,7 +150,12 @@ def _local(name, model, mc, X, targets, params, X_background):
         return a, {"f_x": fxp, "f_baseline": fb, "gap": _gap(fxp, fb, a)}
     elif name == "lime_tabular":
         from lime.lime_tabular import LimeTabularExplainer
-        ex = LimeTabularExplainer(X_background, mode="classification",
+        # sample_scale (optional, default 1, not in DEFAULTS so that existing manifests stay valid): width of the
+        # perturbations in multiples of the training standard deviation (lime samples x + N(0, 1) * std). Passing
+        # the training data scaled by it changes lime's std (sampling) but not the kernel weights: lime computes
+        # distances in units of that same std.
+        scale = float(params.get("sample_scale", 1.0))
+        ex = LimeTabularExplainer(X_background * scale if scale != 1.0 else X_background, mode="classification",
                                   discretize_continuous=params["discretize_continuous"],
                                   sample_around_instance=params["sample_around_instance"],
                                   kernel_width=params["kernel_width"], random_state=params["seed"])
@@ -155,7 +165,7 @@ def _local(name, model, mc, X, targets, params, X_background):
         for i, (x, t) in enumerate(zip(X, targets)):
             e = ex.explain_instance(x, fp, labels=(int(t),), num_features=X.shape[1], num_samples=params["n_samples"])
             for j, w in e.as_map()[int(t)]:
-                out[i, j] = w
+                out[i, j] = w / scale  # lime's slopes are per unit of its std (= scale * training std): per training std
             # surrogate fit: intercept, weighted R^2 on the perturbed samples, surrogate prediction at x
             info["intercept"][i], info["local_r2"][i] = e.intercept[int(t)], e.score[int(t)] \
                 if isinstance(e.score, dict) else e.score
@@ -166,8 +176,19 @@ def _local(name, model, mc, X, targets, params, X_background):
         import shap
         if mc.kind == "torch":
             raise ValueError("shap_tree needs a tree model (rf, xgb)")
-        bg = X_background[np.random.default_rng(params["seed"]).choice(len(X_background), min(params["background_size"],
-                                                                                   len(X_background)), replace=False)]
+        if mc.kind == "xgboost" and params["model_output"] == "probability":
+            import json
+            objective = json.loads(model.get_booster().save_config())["learner"]["objective"]["name"]
+            if objective.startswith("multi:"):
+                raise ValueError(f"shap_tree: shap's TreeExplainer has no probability output for multi-class "
+                                 f"xgboost ({objective}); use model_output='raw' (margins, other units) or ks_shap")
+        if params.get("baseline") is None:
+            bg = X_background[np.random.default_rng(params["seed"]).choice(
+                len(X_background), min(params["background_size"], len(X_background)), replace=False)]
+        elif params["baseline"] == "train_mean":
+            bg = X_background.mean(0, keepdims=True)
+        else:
+            raise ValueError(f"shap_tree baseline: None or 'train_mean', got {params['baseline']!r}")
         ex = shap.TreeExplainer(model, data=bg, model_output=params["model_output"],
                                 feature_perturbation=params["feature_perturbation"])
         sv = np.asarray(ex.shap_values(X))  # (n, d, n_classes) or (n, d) for binary log-odds
@@ -260,12 +281,43 @@ def _global(name, model, mc, task, params):
     raise KeyError(name)
 
 
+def sample_order(y: np.ndarray, seed: int = 0) -> np.ndarray:
+    """An order of all sample positions 0..len(y)-1 whose every prefix is stratified by class (up to rounding):
+    within each class the samples are shuffled with `seed`, and the j-th sample of class c (n_c samples) gets the
+    key (j + 0.5) / n_c; positions are sorted by key (ties: by class). The first n positions are the subset of
+    size n, so subsets of different sizes are nested."""
+    y = np.asarray(y)
+    rng = np.random.default_rng(seed)
+    keys = np.empty(len(y))
+    for c in np.unique(y):
+        pos = np.flatnonzero(y == c)
+        pos = pos[rng.permutation(len(pos))]
+        keys[pos] = (np.arange(len(pos)) + 0.5) / len(pos)
+    return np.lexsort((y, keys))
+
+
+def _sample_indices(task: Task, split: str, samples, sample_seed: int) -> np.ndarray:
+    n_split = len(task.y[split])
+    if samples is None:
+        return np.arange(n_split)
+    if isinstance(samples, (int, np.integer)) and not isinstance(samples, bool):
+        if not 0 < samples <= n_split:
+            raise ValueError(f"samples={samples}: {split} has {n_split} samples")
+        return np.sort(sample_order(task.y[split], sample_seed)[:samples])
+    idx = np.asarray(samples, dtype=np.int64)
+    if idx.ndim != 1 or len(np.unique(idx)) != len(idx) or idx.min() < 0 or idx.max() >= n_split:
+        raise ValueError(f"samples: distinct positions in 0..{n_split - 1} expected")
+    return np.sort(idx)
+
+
 def explain(run: Run, name: str, split: str | None = None, params: dict | None = None,
             models: str | Sequence[int] = "all",
-            out_name: str | None = None) -> Path:
-    """Explain every sample of `split` (a held-out set; which samples it holds is fixed by the task stage).
-    models: 'all', 'rashomon' (requires `select`) or a list of model ids. split: 'holdout_1', 'holdout_2' or
-    'train' (recorded in the manifest)."""
+            out_name: str | None = None, samples: int | Sequence[int] | None = None, sample_seed: int = 0) -> Path:
+    """Explain the samples of `split` (a held-out set; which samples it holds is fixed by the task stage): all of
+    them (samples=None), the first `samples` of `sample_order(y_split, sample_seed)` (a class-stratified subset;
+    smaller sizes give nested subsets) or the given positions. Stored in position order; the positions are
+    recorded as sample_indices. models: 'all', 'rashomon' (requires `select`) or a list of model ids. split:
+    'holdout_1', 'holdout_2' or 'train' (recorded in the manifest)."""
     if name not in GLOBAL and split is None:
         raise ValueError("give the split to explain: 'holdout_1', 'holdout_2' or 'train'")
     params = {**DEFAULTS[name], **(params or {})}
@@ -283,8 +335,12 @@ def explain(run: Run, name: str, split: str | None = None, params: dict | None =
         unknown = set(ids) - set(models_table["model_id"])
         if unknown:
             raise ValueError(f"unknown model ids {sorted(unknown)}")
-    X = task.X[split] if split is not None else task.X["train"][:0]  # global importances: no samples explained
-    idx = np.arange(len(X))
+    if name in GLOBAL:
+        if samples is not None:
+            raise ValueError("samples: only for local explainers")
+        X, idx = task.X["train"][:0], np.arange(0)  # global importances: no samples explained
+    else:
+        X, idx = task.X[split], _sample_indices(task, split, samples, sample_seed)
     X = np.ascontiguousarray(X[idx], dtype=np.float32)
     out_dir = run.dir / "explanations" / (out_name or name)
     results, infos, seconds = [], [], []
@@ -301,6 +357,34 @@ def explain(run: Run, name: str, split: str | None = None, params: dict | None =
     write_json(out_dir / "manifest.json", {
         "explainer": name, "params": params, "split": None if name in GLOBAL else split,
         "model_ids": ids, "models": models, "sample_indices": None if name in GLOBAL else idx.tolist(),
+        "samples": None if samples is None else (int(samples) if isinstance(samples, (int, np.integer)) else "given"),
+        "sample_seed": sample_seed if isinstance(samples, (int, np.integer)) else None,
         "targets": "predicted class of each model", "seconds_per_model": seconds,
         "info": sorted(infos[0]) if infos[0] else None, "environment": environment()})
+    return out_dir
+
+
+DERIVED = {"times_input": "attribution * x (standardised input, i.e. (x - training mean) / training std); for "
+                          "lime_tabular: the local linear model's contribution relative to the training mean"}
+
+
+def derive(run: Run, source: str, out_name: str, op: str = "times_input") -> Path:
+    """A new explanation folder computed from stored explanations, without recomputing them (e.g. lime_tabular
+    slopes -> slope * x). The manifest copies the source's settings and records the derivation; quality measures
+    are not carried over (they refer to the source)."""
+    if op not in DERIVED:
+        raise KeyError(f"op: one of {sorted(DERIVED)}")
+    src = run.explainer_manifest(source)
+    if src["split"] is None:
+        raise ValueError("derive: local explanations only")
+    idx = np.asarray(src["sample_indices"], dtype=np.int64)
+    X = run.load_task().X[src["split"]][idx]
+    a = np.asarray(run.explanations(source, src["split"]), dtype=np.float32) * X[None].astype(np.float32)
+    out_dir = run.dir / "explanations" / out_name
+    if out_dir.exists():
+        raise FileExistsError(out_dir)
+    save_array(out_dir / f"{src['split']}.npy", a)
+    write_json(out_dir / "manifest.json", {**{k: v for k, v in src.items() if k not in ("info", "environment")},
+                                           "info": None, "derived_from": source, "derivation": op,
+                                           "derivation_note": DERIVED[op], "environment": environment()})
     return out_dir

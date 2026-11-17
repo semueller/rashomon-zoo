@@ -20,13 +20,18 @@ Each stage reads and writes stored artefacts only, so stages can be rerun indepe
    evaluation set); the loader's cap on its val split is recorded. Existing tasks are not replaced unless asked.
    This is the only place where data sizes are decided: `train` uses the training split as is, `explain` explains
    whole splits (any split, recorded). Runs record the task hash and check it on load.
-2. `tune` (optional, all model classes): hyperparameter search once per task and model class, scored on a named
-   held-out set (`score_split`, no default); writes `tuning.csv` and the chosen configuration.
+2. `tune` (optional, all model classes): hyperparameter search once per task and model class, scored either on a
+   named held-out set (`score_split`) or by stratified k-fold cross-validation inside the training split (`cv=k`,
+   held-out sets untouched); one of the two must be given. Writes `tuning.csv` (and `folds.csv` with cv) and the
+   chosen configuration (highest mean accuracy).
 3. `train`: one model class with fixed hyperparameters (given, or taken from `tune`), many seeds; writes models,
    class probabilities on both held-out sets and accuracies (`holdout_1_acc`, `holdout_2_acc`).
 4. `select`: marks the Rashomon set with a recorded criterion (default: paper R, all models within 5 percentage
    points of the best model's accuracy on `holdout_1`); writes `selection.json`.
-5. `explain`: an explainer with its hyperparameters on a named split for (a subset of) the models.
+5. `explain`: an explainer with its hyperparameters on a named split for (a subset of) the models and of the
+   split's samples (`samples=n`: the first n of a seeded, class-stratified order, so subsets of different sizes are
+   nested; or explicit positions; recorded as `sample_indices`). `derive` writes a new explanation folder from a
+   stored one without recomputing (`times_input`: attribution * x, e.g. LIME slopes -> contributions).
 Analyses are separate projects that read stored artefacts only and record the Rashomon criterion they relied on.
 
 ## Storage layout
@@ -100,7 +105,10 @@ which keeps attribution scales comparable across explainers and model classes; `
   - `lime_tabular` (lime): regression on perturbed samples around the input (`discretize_continuous=False`,
     `sample_around_instance=True`; both differ from lime's defaults), all features. Returns the coefficients of
     the local linear model (slopes in standardised units), not contributions relative to a baseline.
-- Tree models: `shap_tree` (TreeSHAP), `builtin` (impurity / gain importance, global), `permutation` (global).
+- Tree models: `shap_tree` (TreeSHAP; background: 100 training samples, or `baseline="train_mean"`), `builtin`
+  (impurity / gain importance, global), `permutation` (global). With the training mean as the only background,
+  TreeSHAP on random forests is the exact value ks_shap estimates; on xgboost with probability output it is not
+  (shap 0.54.1 handles the logistic transform approximately; efficiency holds).
 - Every explainer with randomness has a `seed` parameter (set locally, recorded in the manifest); repeated runs
   with different seeds give the run-to-run variation for stability studies.
 - Quality measures stored next to the attributions (`<split>_info.npz`): completeness gap for baseline methods
