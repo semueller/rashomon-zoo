@@ -10,3 +10,6 @@ data/
 
 # PyCharm
 .idea/
+
+# local Claude notes
+CLAUDE.local.md
