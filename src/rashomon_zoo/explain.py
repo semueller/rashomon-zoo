@@ -37,6 +37,7 @@ DEFAULTS = {
     # Lasso(alpha=0.01) surrogate
     "lime_captum": {"n_samples": 300, "seed": 0},
     # shap KernelExplainer: background = one baseline (training mean), i.e. KernelSHAP as defined; exact efficiency;
+    # baseline="train": all training rows as background (observed values only, e.g. for category codes);
     # subset sizes enumerated where the budget allows, complements paired. l1_reg=False: shap 0.54 defaults to
     # "num_features(10)", which would zero all but 10 attributions.
     "ks_shap": {"n_samples": "auto", "baseline": "train_mean", "l1_reg": False, "seed": 0},
@@ -133,10 +134,15 @@ def _local(name, model, mc, X, targets, params, X_background):
         return a, {"f_x": fx, "f_baseline": f(zero), "gap": _gap(fx, f(zero), a)}
     elif name == "ks_shap":
         import shap
+        # baseline "train_mean": the training mean as the only background point; "train": all training rows as the
+        # background distribution (only observed values, e.g. valid category codes; cost grows with the training size)
         if isinstance(params["baseline"], str):
-            if params["baseline"] != "train_mean":
+            if params["baseline"] == "train_mean":
+                bg = X_background.mean(0, keepdims=True)
+            elif params["baseline"] == "train":
+                bg = np.asarray(X_background, dtype=np.float32)
+            else:
                 raise ValueError(params["baseline"])
-            bg = X_background.mean(0, keepdims=True)
         else:
             bg = np.asarray(params["baseline"], dtype=np.float32).reshape(-1, X.shape[1])
         fp = lambda Z: mc.proba(model, np.asarray(Z, dtype=np.float32))  # noqa: E731
@@ -154,11 +160,18 @@ def _local(name, model, mc, X, targets, params, X_background):
         # perturbations in multiples of the training standard deviation (lime samples x + N(0, 1) * std). Passing
         # the training data scaled by it changes lime's std (sampling) but not the kernel weights: lime computes
         # distances in units of that same std.
+        # categorical_features (optional, default none, not in DEFAULTS for the same reason): column indices of
+        # category codes; lime samples them from their training frequencies (not x + N(0, std)) and its local model
+        # uses the binary "same value as x" for them, so the slope is the effect of x's category
         scale = float(params.get("sample_scale", 1.0))
+        cat = [int(c) for c in (params.get("categorical_features") or [])]
+        if cat and scale != 1.0:
+            raise ValueError("sample_scale != 1 would change the category codes in the training data")
         ex = LimeTabularExplainer(X_background * scale if scale != 1.0 else X_background, mode="classification",
                                   discretize_continuous=params["discretize_continuous"],
                                   sample_around_instance=params["sample_around_instance"],
-                                  kernel_width=params["kernel_width"], random_state=params["seed"])
+                                  kernel_width=params["kernel_width"], random_state=params["seed"],
+                                  categorical_features=cat or None)
         fp = lambda Z: mc.proba(model, np.asarray(Z, dtype=np.float32))  # noqa: E731
         out = np.zeros_like(X, dtype=np.float32)
         info = {k: np.zeros(len(X), np.float32) for k in ("intercept", "local_r2", "local_pred")}

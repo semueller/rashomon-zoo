@@ -20,6 +20,9 @@ without a built-in role: every later stage names the held-out set it uses and fo
   loader test -> holdout_1, loader val -> holdout_2 (the loaders' own order; papers R and C used the loader test
   split as their reference set / CFIRE input set and the loader val split for the rule evaluation).
 Everything is recorded in task.json (specification, sizes, indices into the raw data, legacy name mapping).
+"features": column description where the loader gives one (feature names, "numeric" / "categorical" per column,
+category names per categorical column, in code order; categorical columns are integer codes before
+standardisation, which is applied to all columns), else None.
 """
 from __future__ import annotations
 
@@ -63,8 +66,10 @@ def load_dataset(name: str, data_seed: int = DEFAULT_DATA_SEED) -> Task:
     split). Loader test -> holdout_1, loader val -> holdout_2."""
     loader = _loader(name)
     datasets.last_class_names = None
+    datasets.last_feature_info = None
     (X_tr, y_tr), (X_te, y_te), (X_val, y_val), n_dims, n_classes = loader(random_state=data_seed, as_torch=False)
     class_names = datasets.last_class_names
+    features = datasets.last_feature_info
     X = {"train": X_tr, H1: X_te, H2: X_val}
     y = {"train": y_tr, H1: y_te, H2: y_val}
     X = {k: np.asarray(v, dtype=np.float32) for k, v in X.items()}
@@ -73,7 +78,7 @@ def load_dataset(name: str, data_seed: int = DEFAULT_DATA_SEED) -> Task:
     return Task(name=name, X=X, y=y, n_classes=int(n_classes),
                 info={"splits": "legacy", "data_seed": data_seed, "loader": f"rashomon_zoo.datasets.{loader.__name__}",
                       "standardised": "legacy loader: StandardScaler fit on the training split",
-                      "legacy_names": LEGACY_NAMES, "class_names": class_names,
+                      "legacy_names": LEGACY_NAMES, "class_names": class_names, "features": features,
                       "holdout_2_cap_by_loader": cap, "holdout_2_capped": cap is not None and len(y[H2]) == cap})
 
 
@@ -102,6 +107,7 @@ def raw_data(name: str) -> dict:
     saved = datasets._return_dataset, datasets._return_dataverse
     datasets._return_dataset, datasets._return_dataverse = grab_dataset, grab_dataverse
     datasets.last_class_names = None
+    datasets.last_feature_info = None
     try:
         loader(random_state=None, as_torch=False)
     except _Captured:
@@ -111,7 +117,8 @@ def raw_data(name: str) -> dict:
     if not out:
         raise RuntimeError(f"loader of {name!r} does not use a known split helper")
     out["class_names"] = datasets.last_class_names
-    for k in [k for k in out if k != "class_names"]:
+    out["features"] = datasets.last_feature_info
+    for k in [k for k in out if k not in ("class_names", "features")]:
         out[k] = np.asarray(out[k], dtype=np.float32 if k.startswith("X") else np.int64)
     classes = np.unique(np.concatenate([out["y"], out.get("y_test_fixed", out["y"][:0])]))
     if not np.array_equal(classes, np.arange(len(classes))):
@@ -213,6 +220,7 @@ def split_dataset(name: str, splits: tuple[float, ...] | dict[str, int], max_sam
     return Task(name=name, X=Xs, y=ys, n_classes=n_classes, info={
         "splits": list(splits) if isinstance(splits, tuple) else splits, "max_samples": max_samples, "seed": seed,
         "stratified": "by class, every draw", H1: h1_src, "class_names": raw["class_names"],
+        "features": raw["features"],
         "loader": f"rashomon_zoo.datasets.{_loader(name).__name__} (raw data)",
         "standardised": "StandardScaler fit on the training split",
         "scaler": {"mean": scaler.mean_.tolist(), "scale": scaler.scale_.tolist()},

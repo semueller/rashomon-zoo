@@ -411,10 +411,15 @@ def get_gmsc(random_state, batch_sizes=(32, 1050), as_torch=True, root=DATA_ROOT
 # class names of the last dataset loaded (label id -> name), read by rashomon_zoo.tasks right after a loader call;
 # None where the source has no names (e.g. numeric 0/1 columns)
 last_class_names = None
+# column description of the last dataset loaded, for loaders that set it (feature names, "numeric" / "categorical"
+# per column, category names per categorical column); None = not given (all numeric as far as the loader says)
+last_feature_info = None
 
 
-def _get_openml(id, as_array=True):
-    data = fetch_openml(data_id=id, data_home=DATA_ROOT, as_frame=True, cache=True)
+def _get_openml(id, as_array=True, parser="auto"):
+    # parser: fetch_openml's ARFF parser; "liac-arff" for datasets the pandas parser fails on (scikit-learn 1.9:
+    # nominal attributes with integer categories, e.g. abalone's class)
+    data = fetch_openml(data_id=id, data_home=DATA_ROOT, as_frame=True, cache=True, parser=parser)
     X, y, attribute_names = data.data, data.target, data.feature_names
     if not as_array:
         return X, y, attribute_names
@@ -512,6 +517,75 @@ def get_abalone(random_state=42, batch_sizes=(32, 1050), as_torch=True, root=DAT
                            random_state=random_state, split_validation=True, splits=splits)
 
 
+def _openml_with_nominal(id):
+    """OpenML dataset with all columns; nominal columns as integer codes, categories sorted by name (as the class
+    ids). Read with the liac-arff parser (the pandas parser fails on abalone). Sets last_class_names and last_feature_info (names, "numeric" / "categorical" per column, category names
+    per categorical column in code order)."""
+    global last_feature_info
+    X_frame, _, names = _get_openml(id, as_array=False, parser="liac-arff")
+    _, y, _ = _get_openml(id, parser="liac-arff")  # class ids and last_class_names as for the other OpenML loaders
+    cols, types, categories = [], [], []
+    for c in X_frame.columns:
+        s = X_frame[c]
+        if isinstance(s.dtype, pd.CategoricalDtype):
+            cats = sorted(s.dtype.categories, key=str)
+            code = {v: i for i, v in enumerate(cats)}
+            if s.isna().any():
+                raise ValueError(f"OpenML {id}: missing values in nominal column {c!r}")
+            cols.append(np.array([code[v] for v in s], dtype=float))
+            types.append("categorical")
+            categories.append([str(v) for v in cats])
+        else:
+            cols.append(s.to_numpy(dtype=float))
+            types.append("numeric")
+            categories.append(None)
+    last_feature_info = {"feature_names": [str(n) for n in names], "feature_types": types,
+                         "category_names": categories}
+    return np.column_stack(cols), y
+
+
+def get_abalone_full(random_state=42, batch_sizes=(32, 1050), as_torch=True, root=DATA_ROOT,
+                     stratified_sampling=False, splits=(70, 15, 15)):
+    """abalone (OpenML 1557, 3 classes) with all 8 columns: Sex (nominal M / F / I) as codes F=0, I=1, M=2 (sorted
+    by name) and the 7 numeric ones. get_abalone drops Sex."""
+    X, y = _openml_with_nominal(1557)
+    return _return_dataset(X, y, batch_size=batch_sizes, as_torch=as_torch, train_size=-1,
+                           random_state=random_state, split_validation=True, splits=splits)
+
+
+def get_autouniv_full(random_state=42, batch_sizes=(32, 1050), as_torch=True):
+    """autouniv (OpenML 1553, synthetic, 3 classes) with all 12 columns: V5, V6 (2 values), V8, V10 (3 values) as
+    codes of their sorted category names, 8 numeric. get_autouniv keeps V1-V3, V7, V11 only."""
+    X, y = _openml_with_nominal(1553)
+    return _return_dataset(X, y, batch_size=batch_sizes, as_torch=as_torch, train_size=-1,
+                           random_state=random_state, split_validation=True)
+
+
+def get_creditg(random_state=42, batch_sizes=(32, 1050), as_torch=True):
+    """German credit (OpenML 31, credit-g; 1000 samples, classes bad / good 300 / 700): 20 columns, 13 nominal (codes
+    of the sorted category names, 2-10 values), 7 numeric."""
+    X, y = _openml_with_nominal(31)
+    return _return_dataset(X, y, batch_size=batch_sizes, as_torch=as_torch, train_size=-1,
+                           random_state=random_state, split_validation=True)
+
+
+def get_car(random_state=42, batch_sizes=(32, 1050), as_torch=True):
+    """Car evaluation (OpenML 21; 1728 samples, 4 classes acc / good / unacc / vgood 384 / 69 / 1210 / 65): all 6
+    columns nominal (3-4 values; ordinal in the source, coded by sorted name here)."""
+    X, y = _openml_with_nominal(21)
+    return _return_dataset(X, y, batch_size=batch_sizes, as_torch=as_torch, train_size=-1,
+                           random_state=random_state, split_validation=True)
+
+
+def get_bankmarketing(random_state=42, batch_sizes=(32, 1050), as_torch=True):
+    """Bank marketing (OpenML 1461; 45211 samples, classes 1 / 2 = no / yes 39922 / 5289): 16 columns V1-V16, 9
+    nominal (2-12 values), 7 numeric. V12 is the duration of the call, known only after the call (it leaks the
+    label in the usual task setup); kept as in the source."""
+    X, y = _openml_with_nominal(1461)
+    return _return_dataset(X, y, batch_size=batch_sizes, as_torch=as_torch, train_size=-1,
+                           random_state=random_state, split_validation=True)
+
+
 def get_pageblocks(random_state=42, batch_sizes=(32, 1050), as_torch=True, root=DATA_ROOT, stratified_sampling=False):
     # https://www.openml.org/search?type=data&status=active&id=30
 
@@ -552,9 +626,14 @@ __info_dim_classes = {
     'bool': (16, 2),
 
     'abalone': (7, 3),
+    'abalone_full': (8, 3),
+    'car': (6, 4),
+    'creditg': (20, 2),
+    'bankmarketing': (16, 2),
     'vehicle': (18, 4),
     'diggle': (8, 9),
     'autouniv': (5, 3),
+    'autouniv_full': (12, 3),
 
     'fmnist': ((1, 28, 28), 10),
     'emnist': ((1, 28, 28), 47),
@@ -604,6 +683,9 @@ dataset_callables = {
     'winequality': get_winequality,  # openml
     'pageblocks': get_pageblocks,  # openml
     'autouniv': get_autouniv,  # openml, synthetic
+    'abalone_full': get_abalone_full,  # openml, with the nominal column (codes)
+    'autouniv_full': get_autouniv_full,  # openml, synthetic, with the nominal columns (codes)
+    'car': get_car,  # openml, all columns nominal (codes)
     # tabular, binary
     'breastcancer': get_breast_cancer,
     'heloc': get_heloc,  # Dataverse version: leaks the label (see get_heloc)
@@ -616,6 +698,8 @@ dataset_callables = {
     'btsc': get_btsc,
     'spambase': get_spambase,
     'breastw': get_breastw,
+    'creditg': get_creditg,  # openml, 13 of 20 columns nominal (codes)
+    'bankmarketing': get_bankmarketing,  # openml, 9 of 16 columns nominal (codes)
 }
 
 
@@ -632,7 +716,8 @@ cv_tasks = ['fmnist', 'emnist']
 dataverse_tasks = ['heart', 'heloc', 'pima', 'gmsc'] # they have a predetermined train/ test split and with our loading function a fixed validation set as well
 
 
-openml_tasks = ['spf', 'spambase', 'breastw', 'btsc', 'autouniv', 'vehicle', 'abalone', 'diggle']
+openml_tasks = ['spf', 'spambase', 'breastw', 'btsc', 'autouniv', 'vehicle', 'abalone', 'diggle', 'abalone_full',
+                'autouniv_full', 'creditg', 'car', 'bankmarketing']
 
 
 tabular_tasks = [k for k in dataset_callables.keys()
